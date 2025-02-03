@@ -3,8 +3,9 @@
 <package format="3">
   <name>amr_control</name>
   <version>0.0.0</version>
-  <description>The package contains a controller to control robot /description>
+  <description>The package contains a controller to control robot </description>
   <maintainer email="angeloantu@gmail.com">angelo</maintainer>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclpy</depend>
