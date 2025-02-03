@@ -1,0 +1,312 @@
+#include <rclcpp/rclcpp.hpp>
+#include <iostream>
+#include "tf2/LinearMath/Quaternion.h"
+#include "geometry_msgs/msg/transform_stamped.hpp"
+#include "tf2/LinearMath/Matrix3x3.h"
+#include "tf2/exceptions.h"
+#include "tf2_ros/transform_listener.h"
+#include "tf2_ros/buffer.h"
+#include "geometry_msgs/msg/twist.hpp"
+#include <cmath>
+#include <memory>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
+// Define a controller node class inheriting from rclcpp::Node
+class ControllerNode : public rclcpp::Node
+{
+public:
+  // Constructor
+  ControllerNode() : Node("controller_node"), goal_index(0), orientation_goal_reached(false),
+                     distance_goal_reached(false), all_goals_reached(false)
+  {
+  
+   // Set CSV file path
+    csv_file_path = fs::path("src") / "data.csv";
+
+    // Open CSV file for writing
+    csv_file.open(csv_file_path);
+    // Write header to CSV file
+    csv_file << "Distance,Angle,X Array,W Array\n";
+    
+    // Declare parameters for x and y coordinates as empty vectors
+    this->declare_parameter("x", std::vector<double>());
+    this->declare_parameter("y", std::vector<double>());
+
+    // Get x and y coordinates from parameters
+    x_coordinates = this->get_parameter("x").as_double_array();
+    y_coordinates = this->get_parameter("y").as_double_array();
+
+    // Log information about the node being started and loaded file
+    RCLCPP_INFO(this->get_logger(), "The node is started and file is loaded");
+
+    // Get the number of goals from the loaded coordinates
+    no_of_goals = x_coordinates.size();
+    std::cout << "Number of goals: " << no_of_goals << std::endl;
+
+    // If goals are provided, initialize the first goal
+    if (no_of_goals > 0)
+    {
+      x_goal = x_coordinates[goal_index];
+      y_goal = y_coordinates[goal_index];
+    }
+    else
+    {
+      // Log error if no goals are provided
+      RCLCPP_ERROR(this->get_logger(), "No goals provided.");
+      return;
+    }
+
+    // Initialize member variables
+    x_current = 0.0;
+    y_current = 0.0;
+    yaw = 0.0;
+    kp_angular = 0.6;
+    kp_linear = 0.40;
+
+    // Create TF2 buffer and listener
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+    // Create publisher for velocity commands
+    velocity_publisher = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 1);
+
+    // Create timer for periodic execution of goToGoal function
+    timer_ = this->create_wall_timer(std::chrono::milliseconds(100),
+                                     std::bind(&ControllerNode::goToGoal, this));
+  }
+  
+  
+    // Destructor
+  ~ControllerNode()
+  {
+    // Close CSV file when node is destroyed
+    if (csv_file.is_open())
+    {
+      csv_file.close();
+    }
+  }
+
+private:
+
+  // Member variable to store CSV file stream
+  std::ofstream csv_file;
+  fs::path csv_file_path;
+  std::vector<std::pair<double, double>> cmd_vel_values; // Pair of linear and angular velocity
+    double initial_distance;
+  double initial_angle;
+
+
+  // Function to log data to CSV file
+void logData(double distance, double angle)
+{
+  std::stringstream x_array_stream;
+  std::stringstream w_array_stream;
+
+
+  // Log series of cmd_vel values
+  for (const auto& vel : cmd_vel_values)
+  {
+    x_array_stream << vel.first << ";";
+    w_array_stream << vel.second <<";";
+  }
+
+  std::string x_array = x_array_stream.str();
+    std::string w_array = w_array_stream.str();
+
+
+  // Write data to CSV file
+  csv_file << distance << "," << angle << "," << x_array << "," << w_array << "\n";
+
+  // Clear cmd_vel values after logging
+  cmd_vel_values.clear();
+}
+
+
+  // Function to set initial orientation towards the goal
+  void setInitialOrientation(double x_goal, double y_goal, double x_current, double y_current, double yaw)
+  {
+    auto velocity_message = geometry_msgs::msg::Twist();
+    double desired_angle_goal = std::atan2(y_goal - y_current, x_goal - x_current);
+    double angle_difference =  desired_angle_goal - yaw;
+
+    double angular_speed = angle_difference;
+    
+    if(angle_difference>360-angle_difference)
+    {
+    	angular_speed=angular_speed*-1;
+    }
+    
+    if (std::fabs(desired_angle_goal - yaw) > 0.01)
+    {
+      velocity_message.angular.z = angular_speed * kp_angular;
+      cmd_vel_values.push_back(std::make_pair(velocity_message.linear.x, velocity_message.angular.z));
+      velocity_publisher->publish(velocity_message);
+    }
+    else
+    {
+      velocity_message.angular.z = 0.0;
+      cmd_vel_values.push_back(std::make_pair(velocity_message.linear.x, velocity_message.angular.z));
+      velocity_publisher->publish(velocity_message);
+      orientation_goal_reached = true;
+    }
+  }
+
+  // Function to move towards the goal
+  void moveTowardsGoal(double x_goal, double y_goal, double x_current, double y_current, double yaw)
+  {
+    auto velocity_message = geometry_msgs::msg::Twist();
+    double distance = std::abs(std::sqrt(std::pow((x_goal - x_current), 2) + std::pow((y_goal - y_current), 2)));
+    double desired_angle_goal = std::atan2(y_goal - y_current, x_goal - x_current);
+    double angle_difference = desired_angle_goal - yaw;
+
+    double angular_speed = angle_difference;
+    
+    if(angle_difference>360-angle_difference)
+    {
+    	angular_speed=angular_speed*-1;
+    }
+
+   double val=(abs(angular_speed*distance*8));
+   
+   if(val>distance)
+     val=distance;
+   	
+    if (distance > 0.1)
+    {
+      velocity_message.linear.x = (distance-val) * kp_linear;
+      velocity_message.angular.z = angular_speed * kp_angular*1.6;
+            cmd_vel_values.push_back(std::make_pair(velocity_message.linear.x, velocity_message.angular.z));
+      velocity_publisher->publish(velocity_message);
+    }
+    else
+    {
+      velocity_message.linear.x = 0.0;
+      velocity_message.angular.z = 0.0;
+            cmd_vel_values.push_back(std::make_pair(velocity_message.linear.x, velocity_message.angular.z));
+      velocity_publisher->publish(velocity_message);
+      distance_goal_reached = true;
+    }
+  }
+
+  // Function to navigate to the goal
+  void goToGoal()
+  {
+    std::string from_frame_rel = "base_link";
+    std::string to_frame_rel = "odom";
+
+    geometry_msgs::msg::TransformStamped t;
+    try
+    {
+      t = tf_buffer_->lookupTransform(to_frame_rel, from_frame_rel, tf2::TimePointZero, std::chrono::milliseconds(100));
+    }
+    catch (const tf2::TransformException &ex)
+    {
+      auto velocity_message = geometry_msgs::msg::Twist();
+      velocity_message.linear.x = 0.0;
+      velocity_message.angular.z = 0.0;
+      velocity_publisher->publish(velocity_message);
+
+      // Log error if transformation cannot be performed
+      RCLCPP_INFO(
+          this->get_logger(), "Could not transform %s to %s: %s",
+          to_frame_rel.c_str(), from_frame_rel.c_str(), ex.what());
+      return;
+    }
+    x_current = t.transform.translation.x;
+    y_current = t.transform.translation.y;
+
+    tf2::Quaternion q(
+        t.transform.rotation.x,
+        t.transform.rotation.y,
+        t.transform.rotation.z,
+        t.transform.rotation.w);
+
+    tf2::Matrix3x3 m(q);
+    double roll, pitch;
+    m.getRPY(roll, pitch, yaw);
+
+    // Check if all goals are reached
+    if (!all_goals_reached)
+    {
+      if (!orientation_goal_reached)
+      {
+      
+      if (cmd_vel_values.empty())
+      {
+        initial_distance = std::abs(std::sqrt(std::pow((x_goal - x_current), 2) + std::pow((y_goal - y_current), 2)));
+        initial_angle = std::atan2(y_goal - y_current, x_goal - x_current);
+      }
+        setInitialOrientation(x_goal, y_goal, x_current, y_current, yaw);
+      }
+      
+      else if (!distance_goal_reached)
+      {
+        moveTowardsGoal(x_goal, y_goal, x_current, y_current, yaw);
+      }
+      else
+      {
+        // Log information about reaching the goal and fetch next goal
+        logData(initial_distance, initial_angle);
+        RCLCPP_INFO(this->get_logger(), "Goal x: %f Y: %f reached.", x_goal, y_goal);
+        RCLCPP_INFO(this->get_logger(), "Fetching next goal.........");
+        goal_index++;
+        RCLCPP_INFO(this->get_logger(), "Goal Number: %d", goal_index + 1);
+
+        // Check if there are more goals to navigate
+        if (goal_index < no_of_goals)
+        {
+          orientation_goal_reached = false;
+          distance_goal_reached = false;
+          x_goal = x_coordinates[goal_index];
+          y_goal = y_coordinates[goal_index];
+          RCLCPP_INFO(this->get_logger(), "New Goal x: %f New Goal Y: %f", x_goal, y_goal);
+(std::chrono::seconds(1));
+        }
+        else
+        {
+          // Mark all goals as reached
+          all_goals_reached = true;
+          RCLCPP_INFO(this->get_logger(), "No Next Goal Found");
+        }
+      }
+    }
+    
+    
+    else
+    {
+      // Log once when all goals are completed
+      RCLCPP_INFO_ONCE(this->get_logger(), "All goals completed");
+    }
+  }
+
+  // Member variables
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr velocity_publisher;
+  rclcpp::TimerBase::SharedPtr timer_;
+  std::vector<double> x_coordinates;
+  std::vector<double> y_coordinates;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  double x_current, x_goal, y_current, y_goal, kp_angular, kp_linear, yaw;
+  int no_of_goals, goal_index;
+  bool orientation_goal_reached, distance_goal_reached, all_goals_reached;
+};
+
+// Main function
+int main(int argc, char *argv[])
+{
+  // Initialize ROS node
+  rclcpp::init(argc, argv);
+  
+  // Create and run the controller node
+  rclcpp::spin(std::make_shared<ControllerNode>());
+  
+  // Shutdown ROS
+  rclcpp::shutdown();
+  
+  return 0;
+}
+
